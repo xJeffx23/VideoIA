@@ -1,0 +1,1392 @@
+# -*- coding: utf-8 -*-
+"""Shared helpers for the skill's scripts: project paths, brands, video settings, ffmpeg, word search.
+
+Imported by the other scripts (brand.py, reelcfg.py, visual_plan.py, footage.py, memes.py, ...). Standard library
+only. No network access and no credentials here: online sources live in the it-reelsmaker-online add-on, which this
+module loads only when it is installed (see online()).
+"""
+import contextlib, importlib, json, math, os, re, shutil, subprocess, sys, tempfile, time, unicodedata, uuid
+from pathlib import Path
+
+SKILL = Path(__file__).resolve().parent.parent
+DEFAULTS_FILE = SKILL / "assets" / "reel-defaults.json"
+# A personal copy of the skill can keep its own defaults next to the shared ones (deep-merged on top);
+# the published plugin has no such file.
+DEFAULTS_LOCAL = SKILL / "assets" / "reel-defaults.local.json"
+SETTINGS_FILE = "it-reelsmaker.json"
+# Your own defaults for a project: <project>/reel-defaults.json, the same format, only the keys you change. It lives
+# in the project, never in the plugin folder (an update replaces that folder).
+PROJECT_DEFAULTS = "reel-defaults.json"
+
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+GIF_EXT = {".gif"}
+
+
+def utf8_stdio():
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+def warn(msg):
+    print("! " + msg, file=sys.stderr)
+
+
+_WARNED = set()
+
+
+def warn_once(msg):
+    """Warn once per process (load_config is called several times per command)."""
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        warn(msg)
+
+
+def load_json(p, default=None):
+    p = Path(p)
+    for _ in range(40):
+        if not p.exists():
+            return default
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except PermissionError:  # Windows: another process is replacing the file right now (save_json -> os.replace)
+            time.sleep(0.05)
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def save_json(p, obj):
+    """Atomic write: a unique temp file in the same folder, then os.replace. A reader sees the old file or the new
+    one, never half of it. Only locked() / editing_json() protect against losing someone else's update."""
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        for k in range(60):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:  # Windows: the file is open for reading in another process; wait
+                if k == 59:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+_HELD = {}
+
+
+@contextlib.contextmanager
+def locked(p, timeout=30.0, stale=120.0):
+    """Lock a read-modify-write cycle between sessions: a <name>.lock file next to it, created exclusively.
+    Re-entry in the same process doesn't wait. A lock older than `stale` seconds counts as abandoned (its process
+    died) and is removed, so keep only quick work inside: no downloads, no renders."""
+    key = os.path.normcase(os.path.abspath(p))
+    if _HELD.get(key):
+        _HELD[key] += 1
+        try:
+            yield
+        finally:
+            _HELD[key] -= 1
+        return
+    lk = Path(key + ".lock")
+    lk.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    while True:
+        try:
+            fd = os.open(lk, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time():.0f}\n".encode())
+            os.close(fd)
+            break
+        except (FileExistsError, PermissionError):
+            try:
+                if time.time() - lk.stat().st_mtime > stale:
+                    warn(f"removing an abandoned lock {lk.name} (older than {stale:.0f} s)")
+                    lk.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.time() - t0 > timeout:
+                sys.exit(f"the file has been busy in another session for over {timeout:.0f} s: {lk}; try again later "
+                         f"(if no other session is running, delete this .lock)")
+            time.sleep(0.1)
+    _HELD[key] = 1
+    try:
+        yield
+    finally:
+        _HELD.pop(key, None)
+        try:
+            lk.unlink()
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def editing_json(p, default=None):
+    """with editing_json(path, {}) as obj: ... reads under the lock, change obj in place, written atomically.
+    An exception or sys.exit inside leaves the file unchanged."""
+    with locked(p):
+        obj = load_json(p, default)
+        yield obj
+        save_json(p, obj)
+
+
+def _merge(base, over):
+    """Deep merge of dicts: `over` wins (nested dicts are merged key by key)."""
+    out = json.loads(json.dumps(base))
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def defaults_layers(project=None):
+    """The defaults as (label, doc) layers, left to right: the skill's assets/reel-defaults.json; the online add-on's
+    DEFAULTS if it is installed; a personal copy's assets/reel-defaults.local.json; the project's own
+    <project>/reel-defaults.json ("project"); the file named in REELS_DEFAULTS_OVERLAY ("overlay")."""
+    layers = [("defaults", load_json(DEFAULTS_FILE, {}) or {})]
+    ext = online()
+    if ext and isinstance(getattr(ext, "DEFAULTS", None), dict):
+        layers.append(("defaults", ext.DEFAULTS))
+    project = Path(project or project_root())
+    for label, f in (("defaults", DEFAULTS_LOCAL), ("project", project / PROJECT_DEFAULTS),
+                     ("overlay", os.environ.get("REELS_DEFAULTS_OVERLAY"))):
+        if f and Path(f).is_file():
+            doc = load_json(f, {})
+            if not isinstance(doc, dict):
+                warn(f"{f}: expected a JSON object like assets/reel-defaults.json; ignored")
+                continue
+            layers.append((label, doc))
+    return layers
+
+
+def load_defaults(project=None):
+    """The merged defaults (see defaults_layers)."""
+    doc = {}
+    for _, layer in defaults_layers(project):
+        doc = _merge(doc, layer)
+    return doc
+
+
+# --- Paths -----------------------------------------------------------------------------------------------
+
+def _settings_file(start):
+    for q in [start, *start.parents]:
+        if (q / SETTINGS_FILE).is_file():
+            return q / SETTINGS_FILE
+    return None
+
+
+def project_root(start=None):
+    """The editing project folder: REELS_PROJECT; else project_root from it-reelsmaker.json in the current folder or
+    above; else the nearest folder upwards with edit/ or brands/; else the current folder."""
+    env = os.environ.get("REELS_PROJECT")
+    if env:
+        return Path(env).resolve()
+    p = Path(start or os.getcwd()).resolve()
+    f = _settings_file(p)
+    if f:
+        root = (load_json(f, {}) or {}).get("project_root")
+        if root and not str(root).startswith("${"):
+            return (f.parent / root).resolve()
+    for q in [p, *p.parents]:
+        if (q / "edit").is_dir() or (q / "brands").is_dir():
+            return q
+    return p
+
+
+def project_settings(project=None):
+    """it-reelsmaker.json of the project ({} if there is none)."""
+    project = project or project_root()
+    return load_json(Path(project) / SETTINGS_FILE, {}) or {}
+
+
+def library_dirs(project, s):
+    """The asset library folders: library_dirs from the reel settings, plus the plugin setting assets_dir
+    (it-reelsmaker.json -> assets_dir). A relative path is relative to the project folder; an unexpanded ${...} value
+    counts as not set. Used by footage.py, memes.py and library_catalog.py alike."""
+    project = Path(project)
+    dirs = s.get("library_dirs") or []
+    out = [dirs] if isinstance(dirs, str) else list(dirs)
+    extra = project_settings(project).get("assets_dir")
+    if extra and not str(extra).startswith("${"):
+        extra = str(Path(str(extra)).expanduser())
+        if (project / extra).resolve() not in {(project / d).resolve() for d in out}:
+            out.append(extra)
+    return out
+
+
+SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+
+
+def safe_slug(s, what="slug", dots=False):
+    """A name that becomes part of a path (brand, video id): Latin letters, digits, "-", "_" (dots=True also allows
+    ".", but not ".."). Otherwise `../x` or an absolute path would read and write outside brands/, edit/, public/."""
+    s = str(s or "")
+    if not (NAME_RE if dots else SLUG_RE).fullmatch(s) or ".." in s:
+        sys.exit(f"invalid {what}: {s!r}: Latin letters, digits, '-' and '_' only{', and .' if dots else ''} "
+                 f"(no spaces, / \\ or ..)")
+    return s
+
+
+def inside(root, p, what="path"):
+    """Require the real path to stay inside root, including existing parents of new files."""
+    r, q = os.path.normcase(str(Path(root).resolve())), os.path.normcase(str(Path(p).resolve()))
+    try:
+        ok = os.path.commonpath([r, q]) == r
+    except ValueError:  # different drives
+        ok = False
+    if not ok:
+        sys.exit(f"{what} {p} is outside {root}")
+    return Path(p).resolve()
+
+
+def is_project(project):
+    project = Path(project)
+    return bool(os.environ.get("REELS_PROJECT") or (project / "edit").is_dir() or (project / "brands").is_dir()
+                or (project / SETTINGS_FILE).is_file())
+
+
+def edit_dir(arg, project=None, create=False):
+    """`edit/4821`, `4821` or an absolute path -> the video's folder.
+    create=True: if the folder doesn't exist and the argument is `edit/<id>` or `<id>`, create edit/<id> in the
+    project folder."""
+    p = Path(arg)
+    if p.is_dir():
+        return p.resolve()
+    project = project or project_root()
+    for q in (project / arg, project / "edit" / arg):
+        if q.is_dir():
+            return q.resolve()
+    if create:
+        parts = Path(str(arg).replace("\\", "/")).parts
+        rid = parts[1] if len(parts) == 2 and parts[0] == "edit" else parts[0] if len(parts) == 1 else None
+        if rid is None:
+            sys.exit(f"no video folder: {arg}; only edit/<id> or <id> in the project folder can be created")
+        safe_slug(rid, "video id", dots=True)
+        if not is_project(project):
+            sys.exit(f"no video folder: {arg}, and no editing project was found (no edit/, brands/ or "
+                     f"{SETTINGS_FILE} above {project}); run from the project folder or set REELS_PROJECT")
+        q = project / "edit" / rid
+        q.mkdir(parents=True, exist_ok=True)
+        print(f"created the video folder: {q}")
+        return q.resolve()
+    sys.exit(f"no video folder: {arg}")
+
+
+def rel(p, base):
+    try:
+        return Path(p).resolve().relative_to(Path(base).resolve()).as_posix()
+    except ValueError:
+        return str(p)
+
+
+# --- The online add-on -------------------------------------------------------------------------------------
+
+_ONLINE = None
+
+
+def online():
+    """The it-reelsmaker-online add-on module (reels_online), or None when it is not installed. Its scripts folder
+    comes from REELS_ONLINE_SCRIPTS (the add-on's instructions tell Claude to set it) or from it-reelsmaker.json ->
+    online_scripts. Without it, online sources and generation are simply off."""
+    global _ONLINE
+    if _ONLINE is None:
+        _ONLINE = False
+        d = os.environ.get("REELS_ONLINE_SCRIPTS") or project_settings().get("online_scripts")
+        if d and str(d).startswith("${"):  # an unexpanded plugin setting counts as not set
+            d = None
+        if d:  # ~ is the home folder; a relative path is relative to the project folder
+            try:
+                d = Path(str(d)).expanduser()
+            except RuntimeError:  # ~someone for a user this computer doesn't have: reported as not found below
+                d = Path(str(d))
+            d = str(d if d.is_absolute() else project_root() / d)
+        if d and not Path(d, "reels_online.py").is_file():
+            warn(f"the online add-on is not found in {d} (it was updated or removed); to use it again, run its "
+                 f"link command in this project: python <add-on scripts>/reels_online.py link")
+        elif d:
+            sys.path.insert(0, str(Path(d)))
+            try:
+                _ONLINE = importlib.import_module("reels_online")
+            except Exception as x:  # a broken add-on must not break offline editing
+                warn(f"the online add-on did not load ({x}); continuing without online sources")
+    return _ONLINE or None
+
+
+# --- Brands -----------------------------------------------------------------------------------------------
+
+def brand_roots(project=None):
+    """Where profiles live: the project's brands/ first; a brands/ folder next to the skill only if it exists
+    (a personal copy of the skill). The project's profile wins."""
+    project = project or project_root()
+    roots = [project / "brands"]
+    if (SKILL / "brands").is_dir():
+        roots.append(SKILL / "brands")
+    return roots
+
+
+def list_brands(project=None):
+    seen, out = set(), []
+    for root in brand_roots(project):
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            f = d / "brand.json"
+            if d.name.startswith("_") or not f.is_file() or d.name in seen:
+                continue
+            seen.add(d.name)
+            out.append((d.name, d, load_json(f, {})))
+    return out
+
+
+def find_brand(slug, project=None):
+    safe_slug(slug, "brand slug")
+    for root in brand_roots(project):
+        f = inside(root, root / slug / "brand.json", "brand profile")
+        if f.is_file():
+            return root / slug, load_json(f, {})
+    return None, None
+
+
+def brand_file(value, brand_dir, project=None):
+    """A path from the profile: absolute; relative to the brand folder; to the project; to the skill."""
+    if not value:
+        return None
+    p = Path(value)
+    if p.is_absolute():
+        return p if p.exists() else None
+    project = project or project_root()
+    for base in (brand_dir, project, SKILL):
+        if base and (Path(base) / p).exists():
+            return (Path(base) / p).resolve()
+    return None
+
+
+# --- Video settings ---------------------------------------------------------------------------------------
+
+SETTING_KEYS_BOOL = ["use_broll", "use_project_footage", "use_local_footage", "use_code_scenes",
+                     "use_scenes", "use_memes", "use_local_memes"]
+# Renamed setting keys, old -> new (references/migrations.md): the old name is still read in every layer, and the new
+# one wins when a layer has both. 1.15: the setting turns on code scenes drawn in Remotion, which the old name
+# use_generated_footage did not say (review 2026-10-17).
+RENAMED = {"use_generated_footage": "use_code_scenes"}
+
+
+def renamed(d):
+    """d with the old names of RENAMED under their new ones (the new one wins when both are there)."""
+    if not isinstance(d, dict) or not any(k in d for k in RENAMED):
+        return d
+    return {RENAMED.get(k, k): v for k, v in d.items() if not (k in RENAMED and RENAMED[k] in d)}
+
+
+def to_new_names(d):
+    """Puts the old names of RENAMED in d under their new ones, in place (the new one wins when both are there), so a
+    file written by reelcfg keeps the new name whatever key the call set (review 2026-10-18)."""
+    for old, new in RENAMED.items():
+        if old in d:
+            v = d.pop(old)
+            d.setdefault(new, v)
+    return d
+
+
+def parse_value(v):
+    low = v.strip().lower()
+    if low in ("true", "yes", "on", "1"):
+        return True
+    if low in ("false", "no", "off", "0"):
+        return False
+    if low in ("null", "none"):
+        return None
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+
+def parse_sets(items):
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            sys.exit(f"--set expects key=value, got: {it}")
+        k, v = it.split("=", 1)
+        k = k.strip()
+        if k in RENAMED:
+            warn(f"{k} is now {RENAMED[k]} (1.15): set as {RENAMED[k]}")
+            k = RENAMED[k]
+        out[k] = parse_value(v)
+    return out
+
+
+TONE_PRESETS = ["premium", "warm", "expert", "story", "tech", "friendly", "drive", "bold"]  # quiet -> loud
+TONE_DEFAULT = "expert"
+BRAND_SCHEMA = 2  # 1 -> 2: brand tone (references/migrations.md)
+MEME_SIZES = ["s", "m", "l"]
+# The subtitle band, y in the 1080x1920 frame, one value for every script: cards, memes and scenes keep out of it
+# (visual_plan.py validate, meme_layout.py), faces.py checks faces against it (reel-defaults.json ->
+# meme_layout.subtitles_band overrides it). export puts the subtitles' top at the measured chin + 30 px within
+# SUB_BAND[0]..SUB_MAX_TOP (below are 420 px of UI); with no face measurement the kit's own top, SUB_TOP_KIT
+# (ReelKit.tsx). faces.py once had its own band (1290-1400): zones offered a chest down to 1270, where validate
+# rejected a card, and audit checked a band the render did not have.
+SUB_BAND = (1250, 1430)
+SUB_MAX_TOP = 1390
+SUB_TOP_KIT = 1290
+# The height of the kit's subtitle block at its most, two lines (Subtitles.tsx GEO: "Typewriter" 2 x 56 x 1.22; "Bar"
+# 2 plates of 60 x 1.15 + 13 with a 6 px gap; "Accent" 2 x 66 x 1.15 + 16): export records the band the render has as
+# [top, top + this], below the UI line. The kit never draws a third line (T4: a 56-character phrase wrapped into three
+# lines reached y 1455 while the recorded band ended at 1430).
+SUB_BLOCK_H = {"typewriter": 137, "plate": 170, "accent": 168}
+
+# The "framed" format (references/techniques.md): a horizontal source in a rounded window on the style's field, an
+# optional caps label above it. edit/<id>/reel.json -> "format": "framed", "window": [x, y, w, h] (optional, FRAMED_WINDOW
+# by default), "label": "..." (optional), "subtitles_at": "below" (optional: the subtitle band on the field under the
+# window, not inside it). One window for every script and the kit: faces.py maps its measurement into
+# it, visual_plan.py clamps the camera to it and keeps text inside it, export hands it to ReelKit (props.framed), which
+# draws the window, the label and the video inside it (no per-video composition).
+FORMATS = ("full", "framed")
+FRAMED_WINDOW = (25, 340, 1030, 1240)
+FRAMED_RADIUS = 50     # px, the window's corners (no feathering)
+FRAMED_PAD = 35        # px: text inside the window keeps this far from its sides (x 60 at the default window)
+CORNER_BOX = (828, 236, 112, 112)  # the kit's corner mark over the video (ReelKit.tsx Corner: right 140, top 236, 112 px)
+FRAMED_LABEL_UP = 48   # px: the caps label's top above the window (28 px letters end ~20 px above its edge)
+FRAMED_HOOK_MIN = 76   # px: the smallest hook line inside the window (the 92-120 px rule needs ~230 px of headroom)
+FRAMED_SUB_GAP = 30    # px: "subtitles_at": "below" puts the subtitle block this far under the window's bottom edge
+FRAMED_SUB_AT = ("window", "below")
+
+
+def framed_of(s):
+    """The "framed" layout from a video's settings (reel.json): {"window": [x, y, w, h], "label": str|None,
+    "subtitles_at": "window"|"below"}; None: the full vertical frame."""
+    s = s or {}
+    if s.get("format") != "framed":
+        return None
+    win = s.get("window") or FRAMED_WINDOW
+    try:
+        win = [int(round(float(v))) for v in win][:4]
+    except (TypeError, ValueError):
+        win = list(FRAMED_WINDOW)
+    return {"window": win if len(win) == 4 else list(FRAMED_WINDOW), "label": str(s.get("label") or "").strip() or None,
+            "subtitles_at": "below" if s.get("subtitles_at") == "below" else "window"}
+
+
+def framed_at(e):
+    """The "framed" layout of edit/<id> from its reel.json (the only source of a video's settings), or None."""
+    return framed_of(load_json(Path(e) / "reel.json", {}) or {})
+
+
+def framed_issues(s):
+    """Problems of the format keys (format, window, label) in a video's settings: [] when they are fine."""
+    s = s or {}
+    out, fmt, win = [], s.get("format"), s.get("window")
+    if fmt is not None and fmt not in FORMATS:
+        out.append(f"format {fmt!r}: one of {', '.join(FORMATS)} (framed: a horizontal source in a window)")
+    if win is not None:
+        if not (isinstance(win, (list, tuple)) and len(win) == 4
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in win)):
+            out.append(f"window {win!r}: [x, y, w, h] on the 1080x1920 screen")
+        else:
+            x, y, w, h = win
+            if x < 0 or y < 0 or x + w > 1080 or y + h > 1920 or w < 540 or h < 540:
+                out.append(f"window {list(win)}: inside the 1080x1920 frame and at least 540x540")
+            elif s.get("label") and y - FRAMED_LABEL_UP < 220:
+                out.append(f"window {list(win)}: the label sits {FRAMED_LABEL_UP} px above the window, under the app's "
+                           f"top bar (y < 220): lower the window to y >= {220 + FRAMED_LABEL_UP} or drop the label")
+    at = s.get("subtitles_at")
+    if at is not None and at not in FRAMED_SUB_AT:
+        out.append(f"subtitles_at {at!r}: one of {', '.join(FRAMED_SUB_AT)} (below: the subtitles on the field under the "
+                   f"framed window)")
+    elif at == "below" and not out:
+        x, y, w, h = framed_of({**s, "format": "framed"})["window"]
+        room = 1500 - (y + h + FRAMED_SUB_GAP)
+        need = max(SUB_BLOCK_H.values())
+        if room < need:
+            out.append(f"subtitles_at below: the window ends at y {y + h}, which leaves {max(0, room)} px for the "
+                       f"subtitles above y 1500 ({need} needed for two lines): end the window at y <= "
+                       f"{1500 - need - FRAMED_SUB_GAP} (a 16:9 picture 1030 px wide is 579 px tall: window "
+                       f"[25, 641, 1030, 579])")
+    return out
+
+
+def framed_area(fr):
+    """The text area of the "framed" format (scenes, the hook, boxes, the subtitle band) -> [x0, y0, x1, y1]: inside the
+    window, FRAMED_PAD from its sides, within the safe zone (x 60-960, y 220-1500). With no label, the field above the
+    window joins it: a hook can start there and run into the window's headroom (references/techniques.md)."""
+    x, y, w, h = fr["window"]
+    return [max(60, x + FRAMED_PAD), max(220, y + 20) if fr.get("label") else 220,
+            min(960, x + w - FRAMED_PAD), min(1500, y + h - 20)]
+
+
+def framed_sub_area(fr):
+    """The subtitle band's area in the "framed" format -> [x0, y0, x1, y1]: the window's text area (framed_area), or
+    with "subtitles_at": "below" the field under the window, FRAMED_SUB_GAP below its bottom edge down to y 1500, with
+    the text area's sides (English test talk: the subtitles had to stay off the picture, and the only way was to pad
+    the picture with the field's color through look.grade and make the window taller)."""
+    if fr.get("subtitles_at") != "below":
+        return framed_area(fr)
+    x, y, w, h = fr["window"]
+    return [max(60, x + FRAMED_PAD), min(1500, y + h + FRAMED_SUB_GAP), min(960, x + w - FRAMED_PAD), 1500]
+
+
+def framed_view(window, src):
+    """(window, video rect) on screen for a source of size src = (w, h) laid as a cover in the window, centered (the
+    same mapping as faces.py to_screen and the kit's framed layout)."""
+    fx, fy, fw, fh = window
+    sw, sh = src
+    k = max(fw / sw, fh / sh)
+    return [fx, fy, fw, fh], [fx + (fw - sw * k) / 2, fy + (fh - sh * k) / 2, sw * k, sh * k]
+
+
+def framed_source(e):
+    """(w, h) of the rough cut a "framed" video lays in its window: faces.json's source geometry, else final.mp4."""
+    d = load_json(Path(e) / "faces.json") or {}
+    if d.get("geometry") == "source" and d.get("w") and d.get("h"):
+        return int(d["w"]), int(d["h"])
+    f = Path(e) / "final.mp4"
+    if f.exists():
+        info = probe(f)
+        if info.get("w") and info.get("h"):
+            return int(info["w"]), int(info["h"])
+    return None
+
+
+def cam_fit(z, cx, cy, view=None):
+    """The virtual camera (z, cx, cy) clamped so its window never shows past the video. view = (window, video rect) on
+    screen ("framed": the window and the video's cover in it); None: the whole 1080x1920 frame, cx within
+    [540/z, 1080 - 540/z], cy within [960/z, 1920 - 960/z]. The kit's fitCamera (ReelKit.tsx) is the same rule."""
+    (fx, fy, fw, fh), (vx, vy, vw, vh) = view or ((0, 0, 1080, 1920), (0, 0, 1080, 1920))
+    z = max(1.0, float(z))
+    hx, hy = fw / 2 / z, fh / 2 / z
+    return z, min(max(cx, vx + hx), vx + vw - hx), min(max(cy, vy + hy), vy + vh - hy)
+
+
+def speaker_of(w):
+    """The speaker label of a transcript or caption word: "speaker", or "speaker_id" (the name other word-level tools
+    use) on input; None without one. Labels are strings ("A", "B", or a diarizer's "SPEAKER_00")."""
+    s = w.get("speaker", w.get("speaker_id"))
+    return None if s is None or str(s).strip() == "" else str(s).strip()
+
+
+# --- Numbers and line breaks in speech: structure.py signs, visual_plan.py hints, subs.py lines ---
+# A number is a token of its own: digits with separators, a sign, a currency, %, an ordinal ending ("3rd", Russian
+# "5-ti"); digits inside a word ("ACME24", "B2B", "COVID-19") are a name, not a number (T3: a brand name with digits was
+# taken for a number: a stat-scene hint, "a number -> a card" and the "number" sign on lines without one).
+NUMBER_RE = re.compile(r"(?<![\w\-])[+\-\u2212~\u2248]?[$\u20ac\u00a3\u20bd\u00a5\u20b8]?\d+(?:[.,:/'\u2009\u00a0]\d+)*"
+                       r"(?:%|\u2030|[$\u20ac\u00a3\u20bd\u00a5\u20b8]|\+|[x\u00d7]|[kmb]|st|nd|rd|th|-?[\u0430-\u044f\u0451]{1,3})?(?!\w)",
+                       re.I)
+# number words, every form (a line break never tears one from its word: Russian "more than five / years" was split so):
+# English; Russian 1-10, the tens, the hundreds, a hundred (sotnya), one and a half, several, a couple
+NUMBER_WORDS = set("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+                   "sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred "
+                   "hundreds thousand thousands million millions billion billions dozen dozens half several couple".split()
+                   + "\u043e\u0434\u0438\u043d \u043e\u0434\u043d\u0430 \u043e\u0434\u043d\u043e \u043e\u0434\u043d\u0438 "
+                     "\u043e\u0434\u043d\u043e\u0433\u043e \u043e\u0434\u043d\u043e\u0439 "
+                     "\u043e\u0434\u043d\u043e\u043c\u0443 \u043e\u0434\u043d\u0438\u043c \u043e\u0434\u043d\u043e\u043c "
+                     "\u043e\u0434\u043d\u0443 \u0434\u0432\u0430 \u0434\u0432\u0435 \u0434\u0432\u0443\u0445 "
+                     "\u0434\u0432\u0443\u043c \u0434\u0432\u0443\u043c\u044f \u0442\u0440\u0438 \u0442\u0440\u0435\u0445 "
+                     "\u0442\u0440\u0451\u0445 \u0442\u0440\u0435\u043c \u0442\u0440\u0451\u043c "
+                     "\u0442\u0440\u0435\u043c\u044f \u0447\u0435\u0442\u044b\u0440\u0435 "
+                     "\u0447\u0435\u0442\u044b\u0440\u0435\u0445 \u0447\u0435\u0442\u044b\u0440\u0451\u0445 "
+                     "\u0447\u0435\u0442\u044b\u0440\u0435\u043c \u0447\u0435\u0442\u044b\u0440\u0451\u043c "
+                     "\u0447\u0435\u0442\u044b\u0440\u044c\u043c\u044f \u043f\u044f\u0442\u044c \u043f\u044f\u0442\u0438 "
+                     "\u043f\u044f\u0442\u044c\u044e \u0448\u0435\u0441\u0442\u044c \u0448\u0435\u0441\u0442\u0438 "
+                     "\u0448\u0435\u0441\u0442\u044c\u044e \u0441\u0435\u043c\u044c \u0441\u0435\u043c\u0438 "
+                     "\u0432\u043e\u0441\u0435\u043c\u044c \u0432\u043e\u0441\u044c\u043c\u0438 "
+                     "\u0432\u043e\u0441\u0435\u043c\u044c\u044e \u0434\u0435\u0432\u044f\u0442\u044c "
+                     "\u0434\u0435\u0432\u044f\u0442\u0438 \u0434\u0435\u0432\u044f\u0442\u044c\u044e "
+                     "\u0434\u0435\u0441\u044f\u0442\u044c \u0434\u0435\u0441\u044f\u0442\u0438 "
+                     "\u0434\u0435\u0441\u044f\u0442\u044c\u044e \u0434\u0432\u0430\u0434\u0446\u0430\u0442\u044c "
+                     "\u0434\u0432\u0430\u0434\u0446\u0430\u0442\u0438 \u0442\u0440\u0438\u0434\u0446\u0430\u0442\u044c "
+                     "\u0442\u0440\u0438\u0434\u0446\u0430\u0442\u0438 \u0441\u043e\u0440\u043e\u043a "
+                     "\u0441\u043e\u0440\u043e\u043a\u0430 \u043f\u044f\u0442\u044c\u0434\u0435\u0441\u044f\u0442 "
+                     "\u043f\u044f\u0442\u0438\u0434\u0435\u0441\u044f\u0442\u0438 "
+                     "\u0448\u0435\u0441\u0442\u044c\u0434\u0435\u0441\u044f\u0442 "
+                     "\u0448\u0435\u0441\u0442\u0438\u0434\u0435\u0441\u044f\u0442\u0438 "
+                     "\u0441\u0435\u043c\u044c\u0434\u0435\u0441\u044f\u0442 "
+                     "\u0441\u0435\u043c\u0438\u0434\u0435\u0441\u044f\u0442\u0438 "
+                     "\u0432\u043e\u0441\u0435\u043c\u044c\u0434\u0435\u0441\u044f\u0442 "
+                     "\u0432\u043e\u0441\u044c\u043c\u0438\u0434\u0435\u0441\u044f\u0442\u0438 "
+                     "\u0434\u0435\u0432\u044f\u043d\u043e\u0441\u0442\u043e "
+                     "\u0434\u0435\u0432\u044f\u043d\u043e\u0441\u0442\u0430 \u0441\u0442\u043e \u0441\u0442\u0430 "
+                     "\u0434\u0432\u0435\u0441\u0442\u0438 \u0434\u0432\u0443\u0445\u0441\u043e\u0442 "
+                     "\u0442\u0440\u0438\u0441\u0442\u0430 \u0442\u0440\u0435\u0445\u0441\u043e\u0442 "
+                     "\u0442\u0440\u0451\u0445\u0441\u043e\u0442 \u0447\u0435\u0442\u044b\u0440\u0435\u0441\u0442\u0430 "
+                     "\u0447\u0435\u0442\u044b\u0440\u0435\u0445\u0441\u043e\u0442 "
+                     "\u0447\u0435\u0442\u044b\u0440\u0451\u0445\u0441\u043e\u0442 "
+                     "\u043f\u044f\u0442\u044c\u0441\u043e\u0442 \u0448\u0435\u0441\u0442\u044c\u0441\u043e\u0442 "
+                     "\u0441\u0435\u043c\u044c\u0441\u043e\u0442 \u0432\u043e\u0441\u0435\u043c\u044c\u0441\u043e\u0442 "
+                     "\u0434\u0435\u0432\u044f\u0442\u044c\u0441\u043e\u0442 \u0441\u043e\u0442\u043d\u044f "
+                     "\u0441\u043e\u0442\u043d\u0438 \u0441\u043e\u0442\u0435\u043d "
+                     "\u043f\u043e\u043b\u0442\u043e\u0440\u0430 \u043f\u043e\u043b\u0442\u043e\u0440\u044b "
+                     "\u043f\u043e\u043b\u0443\u0442\u043e\u0440\u0430 "
+                     "\u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e "
+                     "\u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u0438\u0445 \u043f\u0430\u0440\u0430 "
+                     "\u043f\u0430\u0440\u0443".split())
+# Russian: 11-19, thousand, million, billion in every case (one stem each)
+NUMBER_STEM = re.compile(r"^(?:\w+\u043d\u0430\u0434\u0446\u0430\u0442[\u044c\u0438\u044e]|\u0442\u044b\u0441\u044f\u0447\w*|"
+                         r"\u043c\u0438\u043b\u043b\u0438\u043e\u043d\w*|\u043c\u0438\u043b\u043b\u0438\u0430\u0440\u0434\w*)$")
+# short function words that never end a line (typography.md, "Line breaks"; the kit's SHORT in Phrase.tsx), English and
+# Russian: prepositions, conjunctions, articles, pronouns of one or two letters, the negation
+SHORT_WORDS = set("a an the to of in on at by for with from into and or but nor as if so not no my our your its his "
+                  "her their this that i we you he she it".split()
+                  + ("\u0432 \u0432\u043e \u043a \u043a\u043e \u0441 \u0441\u043e \u0443 \u043e \u043e\u0431 "
+                     "\u043e\u0431\u043e \u0438 \u0430 \u043d\u043e \u043d\u0435 \u043d\u0438 \u043d\u0430 \u043f\u043e "
+                     "\u0437\u0430 \u043e\u0442 \u0434\u043e \u0438\u0437 \u0431\u0435\u0437 \u0434\u043b\u044f "
+                     "\u043f\u0440\u0438 \u043f\u0440\u043e \u0447\u0442\u043e \u043a\u0430\u043a \u044d\u0442\u043e "
+                     "\u0442\u043e \u0432\u044b \u043c\u044b \u044f \u043e\u043d \u043e\u043d\u0430 \u0438\u0445 "
+                     "\u0435\u0435 \u0435\u0433\u043e \u043d\u0430\u0434 \u043f\u043e\u0434 "
+                     "\u0447\u0435\u0440\u0435\u0437 \u0438\u043b\u0438 \u0434\u0430").split())
+# particles that lean on the word before them (Russian li, zhe, by, l', zh, b): never the first word of a line
+AFTER_WORDS = set("\u043b\u0438 \u0436\u0435 \u0431\u044b \u043b\u044c \u0436 \u0431".split())
+_EDGE = "\"'()[]{}<>,.;:!?\u2026\u00ab\u00bb\u201c\u201d\u201e\u2018\u2019"
+
+
+def bare(token):
+    """A token without the punctuation around it, lowercase, Russian yo as ye (the word lists hold the ye spelling)."""
+    return str(token).strip(_EDGE + " ").lower().replace("\u0451", "\u0435")
+
+
+def is_number(token):
+    """A number of its own: digits ("12", "60%", "$100", "3rd", "5+") or a number word ("five", Russian "pyati")."""
+    t = str(token).strip(_EDGE + " ")
+    b = bare(token)
+    return bool(NUMBER_RE.fullmatch(t)) or b in NUMBER_WORDS or bool(NUMBER_STEM.match(b))
+
+
+def no_break(prev, nxt):
+    """True: a line (or a subtitle chunk) must not end between these two words: after a short function word, after a
+    number (it goes with its unit or word: "12 days", "five years"), before a dash, a percent sign or a particle that
+    leans back. A word ending in punctuation (a comma, a period) always allows the break."""
+    p = str(prev).strip()
+    if p and p[-1] in ",.;:!?\u2026)\u00bb\u201d":
+        return False
+    n = str(nxt).strip()
+    return (bare(p) in SHORT_WORDS or is_number(p) or n[:1] in ("\u2014", "\u2013", "-", "%") or bare(n) in AFTER_WORDS)
+
+
+def migrate_brand(b):
+    """Bring a profile up to the current schema: only add keys, never delete. -> list of "what changed" lines.
+    Schema 1 (no schema, or 1) -> 2: tone, if missing, becomes expert."""
+    notes = []
+    if int(b.get("schema") or 1) < 2:
+        if not isinstance(b.get("tone"), dict) or not b["tone"].get("preset"):
+            b["tone"] = {"preset": TONE_DEFAULT, "overrides": {}}
+            notes.append(f"the profile had no brand tone, so it is now {TONE_DEFAULT} (calm, memes only on request); "
+                         f"to change it: brand.py tone <slug> <preset>")
+        b["schema"] = 2
+    return notes
+
+
+def tone_rules(brand=None, doc=None, slug=None, profile=None):
+    """The brand tone, resolved: the preset from reel-defaults.json -> brand_tones, plus brand.json -> tone.overrides;
+    an explicit brand.json -> motion overrides the preset's motion. Returns (rules, note): rules["preset"] is the
+    preset name, note is a warning (tone not set / not confirmed / unknown) or None. No tone -> expert.
+    profile: the video's profile id; the brand's own tone for that profile (brand.json -> tone.by_profile, saved once
+    by the brand owner with brand.py tone <slug> <preset> --profile <id>) replaces the preset, without the main tone's
+    overrides; rules["base_preset"] is then the brand's main tone."""
+    doc = doc if doc is not None else load_defaults()
+    tones = {k: v for k, v in (doc.get("brand_tones") or {}).items() if not k.startswith("_")}
+    t = (brand or {}).get("tone") or {}
+    if isinstance(t, str):
+        t = {"preset": t}
+    preset, note = t.get("preset"), None
+    who = f"'{slug or (brand or {}).get('slug') or '?'}'"
+    if brand is not None and not preset:
+        note = (f"brand {who} has no tone; using {TONE_DEFAULT}. Ask for the tone and save it: "
+                f"brand.py tone <slug> {'|'.join(TONE_PRESETS)}")
+    elif preset and preset not in tones:
+        note = f"unknown tone for brand {who}: {preset!r} -> {TONE_DEFAULT} (available: {', '.join(tones)})"
+        preset = None
+    elif t.get("unconfirmed"):
+        note = (f"the tone of brand {who} is not confirmed ({preset} by default); ask the brand owner: "
+                f"brand.py tone <slug> {'|'.join(TONE_PRESETS)}")
+    preset = preset or TONE_DEFAULT
+    alt = (t.get("by_profile") or {}).get(profile) if profile and isinstance(t.get("by_profile"), dict) else None
+    if alt and alt not in tones:
+        note = note or f"brand {who}: unknown tone {alt!r} for profile {profile}: the main tone {preset} applies"
+        alt = None
+    if alt:
+        rules = dict(tones.get(alt, {}))
+        rules["preset"], rules["base_preset"], rules["for_profile"] = alt, preset, profile
+        if (brand or {}).get("motion"):
+            rules["motion"] = brand["motion"]
+        if rules.get("motion") == "calm":
+            rules["overshoot"] = rules["shake"] = False
+        return rules, note
+    rules = _merge(tones.get(preset, {}), t.get("overrides") or {})
+    rules["preset"] = preset
+    if (brand or {}).get("motion"):  # an explicit motion in the profile overrides the preset
+        rules["motion"] = brand["motion"]
+    if rules.get("motion") == "calm":  # calm motion: no bounce or shake, unless set explicitly in overrides
+        for k in ("overshoot", "shake"):
+            if k not in (t.get("overrides") or {}):
+                rules[k] = False
+    if t.get("overrides"):
+        rules["overrides"] = t["overrides"]
+    return rules, note
+
+
+def tone_settings(rules, doc):
+    """Defaults of the brand-tone layer: intensity, meme_size (<= size_max), scene_tone. A tone never turns inserts on
+    (review 2026-10-17: B-roll was on in every preset and memes in two, so "a plain edit by default" held only while the
+    agent remembered to save false): B-roll, memes and scenes come from the person's choice in step 0."""
+    out = {}
+    if rules.get("intensity"):
+        out["intensity"] = rules["intensity"]
+    m = rules.get("memes") or {}
+    cap = m.get("size_max")
+    if cap in MEME_SIZES:
+        base = (doc.get("settings") or {}).get("meme_size") or "m"
+        out["meme_size"] = base if base in MEME_SIZES and MEME_SIZES.index(base) <= MEME_SIZES.index(cap) else cap
+    if rules.get("scene_tone"):
+        out["scene_tone"] = rules["scene_tone"]
+    return out
+
+
+def tone_summary(rules):
+    """One line about the brand tone for reelcfg.py show / brand.py show."""
+    m = rules.get("memes") or {}
+    if m.get("allowed") is False or not m.get("max"):
+        memes = "no memes"
+    else:
+        memes = (f"memes <= {m.get('max')} ({m.get('size_max') or '-'}, "
+                 f"only on request"
+                 f"{', full-frame allowed' if m.get('cutaway') else ''})")
+    tr = ", ".join(rules.get("transitions") or [])
+    extra = [x for x, ok in (("overshoot", rules.get("overshoot")), ("shake", rules.get("shake"))) if ok]
+    via = (f" — the brand's tone for {rules['for_profile']} videos (main tone {rules['base_preset']})"
+           if rules.get("for_profile") else "")
+    return (f"{rules.get('preset')} ({rules.get('label', '')}){via}: {memes}, full <= {rules.get('full_scenes_max')}, "
+            f"transitions {tr} (flash <= {rules.get('flash_max')}, whip <= {rules.get('whip_max')}), "
+            f"scene tone {rules.get('scene_tone')} (allowed: {', '.join(rules.get('scene_tones') or [])}), "
+            f"motion {rules.get('motion')}, technique loudness {rules.get('loudness')}"
+            + (f", {' and '.join(extra)}" if extra else "")
+            + (f"; overridden in the profile: {', '.join(rules['overrides'])}" if rules.get("overrides") else ""))
+
+
+def profiles_of(doc):
+    """{profile id: rules} and {content format id: rules} from reel-defaults.json (references/profiles.md)."""
+    pr = {k: v for k, v in (doc.get("profiles") or {}).items() if not k.startswith("_") and isinstance(v, dict)}
+    pr.pop("common_checklist", None)
+    fm = {k: v for k, v in (doc.get("content_formats") or {}).items() if not k.startswith("_") and isinstance(v, dict)}
+    return pr, fm
+
+
+def profile_rules(s, doc):
+    """The video's profile, resolved: reel.json -> profile, else the content format's default profile. -> a dict with
+    id, label, format, length (the format's range, unless the profile's length_fixed), brand_by_s, cta_max (the
+    format's wins), cta_required, safe_zone, checklist (the common items first), or None (no profile: the video is
+    edited as before 1.8). Unknown ids -> a warning, and they are ignored."""
+    pr, fm = profiles_of(doc)
+    fid = s.get("content_format") or None
+    if fid and fid not in fm:
+        warn_once(f"unknown content_format {fid!r} (known: {', '.join(fm)}): ignored")
+        fid = None
+    pid = s.get("profile") or (fm[fid].get("profile") if fid else None)
+    if pid and pid not in pr:
+        warn_once(f"unknown profile {pid!r} (known: {', '.join(pr)}): the video is edited without a profile")
+        return None
+    if not pid:
+        return None
+    p, f = pr[pid], fm.get(fid) or {}
+    length = p.get("length") if p.get("length_fixed") or not f.get("length") else f["length"]
+    common = (doc.get("profiles") or {}).get("common_checklist") or {}
+    return {"id": pid, "label": p.get("label", pid), "format": fid, "length": length,
+            "brand_by_s": p.get("brand_by_s"), "cta_max": f.get("cta_max", p.get("cta_max", 1)),
+            "cta_required": bool(p.get("cta_required")), "safe_zone": p.get("safe_zone"),
+            "settings": dict(p.get("settings") or {}), "checklist": {**common, **(p.get("checklist") or {})}}
+
+
+INTENSITY_ORDER = ["minimal", "moderate", "active"]
+
+
+def profile_settings(prof, rules, doc, tone_override=False):
+    """The profile's defaults under the brand tone's ceiling -> (settings, notes). A louder intensity than the tone's
+    is held at the tone's (tone_override lifts it); scene_tone may be a list: the first tone the brand allows, none
+    allowed -> the key is left to the tone."""
+    out, notes = {}, []
+    for k, v in (prof.get("settings") or {}).items():
+        if k == "intensity":
+            cap = rules.get("intensity")
+            if (not tone_override and cap in INTENSITY_ORDER and v in INTENSITY_ORDER
+                    and INTENSITY_ORDER.index(v) > INTENSITY_ORDER.index(cap)):
+                notes.append(f"profile {prof['id']} asks for intensity {v}; the brand tone {rules.get('preset')} holds "
+                             f"{cap} (louder on explicit request: tone_override=true)")
+                v = cap
+        elif k == "scene_tone":
+            allowed = rules.get("scene_tones") or []
+            pick = [t for t in (v if isinstance(v, list) else [v]) if not allowed or t in allowed or tone_override]
+            if not pick:
+                continue
+            v = pick[0]
+        out[k] = v
+    return out, notes
+
+
+def load_config(edit=None, overrides=None, project=None):
+    """Layers, in the order of references/brands.md ("Layers"): skill defaults (+ reel-defaults.local.json, the add-on's)
+    <- brand tone preset defaults (brand.json -> tone; never inserts) <- the project's reel-defaults.json <-
+    REELS_DEFAULTS_OVERLAY <- the video's profile (profile_rules, capped by the brand tone) <- brand profile (inserts) <-
+    edit/<id>/reel.json <- overrides (words from the prompt). settings["profile_rules"] is the resolved profile or None. settings["brand_tone"] is the resolved brand tone (the
+    ceilings for visual_plan.py validate); it comes only from the profile, reel.json can't change it (going louder
+    takes tone_override). Returns (settings, provenance, defaults_doc, brand_dir, brand)."""
+    project = project or project_root()
+    doc, prov = {}, {}
+    for label, layer in defaults_layers(project):
+        if isinstance(layer.get("settings"), dict):  # an old key name in a project's or the add-on's defaults
+            layer = {**layer, "settings": renamed(layer["settings"])}
+        doc = _merge(doc, layer)
+        for k in (layer.get("settings") or {}):
+            prov[k] = label
+    settings = dict(doc.get("settings", {}))
+    reel = renamed(load_json(Path(edit) / "reel.json", {}) if edit else {})
+    overrides = renamed(overrides or {})
+    slug = overrides.get("brand") or reel.get("brand") or settings.get("brand")
+    bdir, brand = find_brand(slug, project) if slug else (None, None)
+    if slug and brand is None:
+        warn(f"brand '{slug}' not found in {', '.join(str(r) for r in brand_roots(project))}; "
+             f"create it: brand.py new --name ... --colors ...")
+    # the video's profile (references/profiles.md) is known before the tone: a brand may keep its own tone for it
+    asked = {**settings, **reel, **overrides}
+    prof = profile_rules(asked, doc)
+    rules, note = tone_rules(brand, doc, slug, prof["id"] if prof else None)
+    if note:
+        warn_once(note)
+    for k, v in tone_settings(rules, doc).items():
+        if prov.get(k) in ("project", "overlay") and k != "meme_size":
+            continue  # your own project defaults beat the preset's guesses; meme_size is already capped by the tone
+        settings[k], prov[k] = v, f"tone:{rules['preset']}"
+    # the profile's defaults: after the project's defaults, under the brand tone's ceiling
+    if prof:
+        vals, notes = profile_settings(prof, rules, doc, bool(asked.get("tone_override")))
+        for k, v in renamed(vals).items():  # review 2026-10-18: a profile with the old name was not renamed
+            settings[k], prov[k] = v, f"profile:{prof['id']}"
+        prof["notes"] = notes
+    for k, v in renamed((brand or {}).get("inserts") or {}).items():
+        settings[k], prov[k] = v, f"brand:{slug}"
+    for k, v in reel.items():
+        if k in ("brand_snapshot", "notes"):
+            continue
+        settings[k], prov[k] = v, "reel.json"
+    for k, v in overrides.items():
+        settings[k], prov[k] = v, "override"
+    settings["brand"] = slug
+    settings["use_generated_footage"] = settings.get("use_code_scenes")  # the old name, read by the add-on <= 1.4.5
+    settings["brand_tone"] = rules
+    settings["profile_rules"] = prof
+    prov["brand_tone"] = f"brand:{slug}" if brand and brand.get("tone") else f"tone:{rules['preset']} (not set)"
+    if settings.get("intensity") not in (doc.get("intensity") or {}):
+        warn(f"unknown intensity {settings.get('intensity')!r} -> moderate")
+        settings["intensity"] = "moderate"
+    return settings, prov, doc, bdir, brand
+
+
+def effective(settings):
+    """What will actually turn on. Every "no" has a reason (this is the fallback logic). Online sources and
+    generation are decided by the online add-on when it is installed; without it they are off."""
+    s = settings
+    eff, why = {}, {}
+
+    def put(name, ok, reason=""):
+        eff[name] = bool(ok)
+        if not ok and reason:
+            why[name] = reason
+
+    broll = s.get("use_broll", False)
+    put("broll", broll, "use_broll=false")
+    put("project_footage", broll and s.get("use_project_footage"), "off")
+    put("local_footage", broll and s.get("use_local_footage"), "off")
+    gen = broll and s.get("use_code_scenes")
+    engines = s.get("generation_engines") or ["code"]
+    put("generated_code", gen and "code" in engines, "off" if not gen else "the code engine is not allowed")
+    memes = s.get("use_memes", False)
+    bt = s.get("brand_tone") if isinstance(s.get("brand_tone"), dict) else {}
+    if memes and (bt.get("memes") or {}).get("allowed") is False and not s.get("tone_override"):
+        memes = False
+        put("memes", False, f"brand tone {bt.get('preset')} doesn't allow memes (reel.json -> tone_override: true "
+                            f"goes louder on explicit request)")
+    else:
+        put("memes", memes, "use_memes=false")
+    put("local_memes", memes and s.get("use_local_memes"), "off")
+    put("scenes", s.get("use_scenes"), "use_scenes=false")  # designed scenes, drawn in code by the kit
+    ext = online()
+    if ext:
+        ext.effective_online(s, put, eff)
+    else:
+        for name in ("online_footage", "generated_prompts", "generate_now", "online_memes"):
+            asked = s.get({"online_footage": "use_online_footage", "online_memes": "use_online_memes"}.get(name, ""))
+            put(name, False, "the online add-on is not installed" if asked else "off")
+        eff["online_footage_providers"], eff["online_meme_providers"] = [], []
+    return eff, why
+
+
+def budget(duration, settings, doc):
+    b = dict((doc.get("intensity") or {}).get(settings.get("intensity", "moderate"), {}))
+    per = b.get("broll_per_30s", 3)
+    b["broll_max"] = max(1, math.ceil(duration / 30.0 * per)) if per else 0
+    b["coverage_max_s"] = round(duration * b.get("coverage_max", 0.2), 2)
+    return b
+
+
+# --- Media ------------------------------------------------------------------------------------------------
+
+def local_media_args(args):
+    """Limit media inputs to file/pipe; lavfi inputs have no file protocol options."""
+    args = [str(a) for a in args]
+    tool = Path(args[0]).stem.lower()
+    if tool == "ffprobe":
+        return [args[0], "-protocol_whitelist", "file,pipe", *args[1:]]
+    if tool != "ffmpeg":
+        return args
+    out, fmt = [], None
+    for i, arg in enumerate(args):
+        if arg == "-f" and i + 1 < len(args):
+            fmt = args[i + 1]
+        if arg == "-i":
+            if fmt != "lavfi":
+                out.extend(["-protocol_whitelist", "file,pipe"])
+            fmt = None
+        out.append(arg)
+    return out
+
+
+def save_text(p, text):
+    """Atomically publish UTF-8 text with LF endings; callers lock read-modify-write."""
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def run(args, check=True, quiet=False):
+    r = subprocess.run(local_media_args(args), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{Path(str(args[0])).name} failed:\n" + r.stderr[-1500:])
+    return r
+
+
+def audio_offset(p):
+    """Seconds by which the audio track starts after the video track (negative: before), from the container; for
+    the record only (extraction uses ANALYSIS_AF). A phone MOV often has 0.08-0.10 s: audio extracted without
+    ANALYSIS_AF runs ahead of the video by that much, and every edge measured on it lands that much early in cut.py,
+    which cuts by the video timeline (a real case: word endings clipped in every take)."""
+    r = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", str(p)], check=False)
+    try:
+        st = {}
+        for s in json.loads(r.stdout or "{}").get("streams", []):
+            if s.get("codec_type") in ("video", "audio") and s.get("codec_type") not in st and s.get("start_time") not in (None, "N/A"):
+                st[s["codec_type"]] = float(s["start_time"])
+        return round(st["audio"] - st["video"], 6) if "audio" in st and "video" in st else 0.0
+    except (ValueError, KeyError, TypeError):
+        return 0.0
+
+
+# Extracting a whole track for analysis: second t of the WAV = second t of the video. first_pts=0 pads (or trims) the
+# start by the audio's real decoded timestamps, so the encoder delay of AAC is accounted for too (the start_time from
+# audio_offset alone was 24 ms off on an ffmpeg-made file); 16 kHz mono is what speech_mask.py and Whisper read.
+ANALYSIS_AF = "aresample=16000:async=1:first_pts=0"
+
+
+def probe(p):
+    """w, h, dur, fps, has_audio, vcodec, pix_fmt (the phone rotation tag applied)."""
+    r = run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(p)], check=False)
+    try:
+        d = json.loads(r.stdout or "{}")
+    except Exception:
+        d = {}
+    info = {"w": None, "h": None, "dur": None, "fps": None, "has_audio": False, "vcodec": None, "pix_fmt": None}
+    for s in d.get("streams", []):
+        if s.get("codec_type") == "video" and info["w"] is None:
+            w, h = s.get("width"), s.get("height")
+            rot = 0
+            for sd in s.get("side_data_list", []) or []:
+                if "rotation" in sd:
+                    rot = abs(int(float(sd["rotation"])))
+            if rot in (90, 270):
+                w, h = h, w
+            info.update(w=w, h=h, vcodec=s.get("codec_name"), pix_fmt=s.get("pix_fmt"),
+                        sar=s.get("sample_aspect_ratio") or "1:1")
+            fr = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+            try:
+                a, b = fr.split("/")
+                info["fps"] = round(float(a) / float(b), 3) if float(b) else None
+            except Exception:
+                pass
+            if s.get("duration"):
+                info["dur"] = float(s["duration"])
+        elif s.get("codec_type") == "audio":
+            info["has_audio"] = True
+    if info["dur"] is None and d.get("format", {}).get("duration"):
+        try:
+            info["dur"] = float(d["format"]["duration"])
+        except Exception:
+            pass
+    return info
+
+
+def media_kind(p):
+    ext = Path(p).suffix.lower()
+    return "video" if ext in VIDEO_EXT else "image" if ext in IMAGE_EXT else "gif" if ext in GIF_EXT else None
+
+
+# --- Word search (any language, no libraries) ----------------------------------------------------------------
+
+# Short function words that carry no meaning in a search: English, plus the most common Russian ones given as
+# Unicode code points (so that this file stays plain English text).
+_RU_STOP = ("438", "432", "432 43e", "43d 430", "441", "441 43e", "43a", "43a 43e", "43f 43e", "438 437", "437 430",
+            "43e 442", "434 43e", "443", "43e", "43e 431", "430", "43d 43e", "438 43b 438", "436 435", "43b 438",
+            "43d 435", "43d 438", "442 43e", "44d 442 43e", "43a 430 43a", "447 442 43e", "434 43b 44f")
+STOP = set("the a an of to in on and or for with is are be at by from as it this that".split()) | {
+    "".join(chr(int(c, 16)) for c in w.split()) for w in _RU_STOP}
+_YO, _YE = chr(0x451), chr(0x435)
+
+
+def tokens(s):
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s or "")  # split camelCase file names before lowercasing
+    s = s.lower().replace(_YO, _YE)  # Russian yo -> ye: both spellings match
+    return [t for t in re.split(r"[\W_]+", s) if t and t not in STOP and len(t) > 1]
+
+
+def _match(a, b):
+    if a == b:
+        return True
+    n = min(len(a), len(b))
+    return n >= 4 and a[:max(4, n - 2)] == b[:max(4, n - 2)]
+
+
+def score(query, text):
+    """Share of the query's words found in the text (a word matches by its stem: a common prefix of 4+ letters)."""
+    q, t = tokens(query), set(tokens(text))
+    if not q:
+        return 0.0
+    hit = sum(1 for a in q if any(_match(a, b) for b in t))
+    return round(hit / len(q), 3)
+
+
+def forbidden_hits(brand, text):
+    """Which imagery the brand forbids (forbidden_imagery / _en) resembles the text. Words match allowing for
+    endings (globe/globes), without false hits like hands ~ handshake."""
+    tt = set(tokens(text))
+    hits = []
+    for f in (brand or {}).get("forbidden_imagery", []) + (brand or {}).get("forbidden_imagery_en", []):
+        ft = tokens(f)
+
+        def near(t):
+            for t2 in tt:
+                k = len(os.path.commonprefix([t, t2]))
+                if abs(len(t) - len(t2)) <= 3 and k >= max(4, min(len(t), len(t2)) - 2):
+                    return True
+            return False
+        if ft and all(near(t) for t in ft):
+            hits.append(f)
+    return hits
+
+
+# --- Stems for comparing takes: structure.py retakes, cut.py repeats at the joins ---------------------------------
+# A take is the same line said again, often cut off mid-word ("situa-" for "situation"), so words are compared by a
+# stem: the first STEM_LEN letters, a shorter word whole. Function words, pronouns and particles do not make two lines
+# alike: they are left out, with every word of one or two letters. Russian ones are given as code points.
+STEM_LEN = 5
+TAKE_STOP = STOP | SHORT_WORDS | AFTER_WORDS | set(
+    "you your yours we our ours they them their he him his she her it its is are was were be been being am have has had "
+    "do does did done so just that this these those there here then than what when where who whom which how why very "
+    "also too even still yet can could will would should shall may might must not no yes yeah oh ok okay well like "
+    "really all any some one me my mine us about out up down over again more most much many only own same such now "
+    "let lets".split()) | set(
+    ("\u0442\u0430\u043a \u0432\u043e\u0442 \u0435\u0441\u043b\u0438 \u0447\u0442\u043e\u0431\u044b "
+     "\u0435\u0433\u043e \u0435\u043c\u0443 \u043d\u0430\u0441 \u0432\u0430\u0441 \u0432\u0430\u043c "
+     "\u043d\u0430\u043c \u0443\u0436\u0435 \u0435\u0449\u0435 \u0442\u043e\u0436\u0435 "
+     "\u0442\u0430\u043c \u0442\u0443\u0442 \u0433\u0434\u0435 \u043a\u043e\u0433\u0434\u0430 "
+     "\u043e\u0447\u0435\u043d\u044c \u043f\u0440\u043e\u0441\u0442\u043e \u0434\u0430\u0436\u0435 "
+     "\u0435\u0441\u0442\u044c \u0431\u044b\u043b \u0431\u044b\u043b\u0430 \u0431\u044b\u043b\u0438 "
+     "\u0431\u044b\u043b\u043e \u0431\u044b\u0442\u044c \u043c\u043e\u0436\u0435\u0442 "
+     "\u043d\u0430\u0434\u043e \u043d\u0443\u0436\u043d\u043e \u043e\u043d\u0438 \u043e\u043d\u0430 "
+     "\u043e\u043d\u043e \u043c\u043d\u0435 \u043c\u0435\u043d\u044f \u0442\u0435\u0431\u0435 "
+     "\u0442\u0435\u0431\u044f \u0441\u0435\u0431\u044f \u0441\u0435\u0431\u0435 \u0432\u0441\u0435 "
+     "\u0432\u0441\u0435\u0445 \u0432\u0441\u0435\u043c \u044d\u0442\u043e\u0442 \u044d\u0442\u0430 "
+     "\u044d\u0442\u0438 \u044d\u0442\u043e\u0433\u043e \u044d\u0442\u043e\u0439 "
+     "\u044d\u0442\u043e\u043c \u0442\u043e\u0442 \u0442\u043e\u0433\u043e \u0442\u043e\u043c "
+     "\u0442\u043e\u0439 \u0442\u0435 \u043a\u0442\u043e \u0447\u0435\u043c \u0447\u0435\u0433\u043e "
+     "\u043a\u043e\u0433\u043e \u043d\u0438\u043c \u043d\u0438\u043c\u0438 \u043d\u0438\u0445 "
+     "\u043d\u0435\u043c \u043d\u0435\u0439 \u043d\u0443 \u043d\u0435\u0442 \u0432\u0435\u0434\u044c "
+     "\u0432\u043e\u043e\u0431\u0449\u0435 \u0430\u0433\u0430 \u0442\u0430\u043a\u0436\u0435 "
+     "\u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u0442\u043e\u043c \u0442\u043e\u0433\u0434\u0430 "
+     "\u0441\u0435\u0439\u0447\u0430\u0441 \u0431\u0443\u0434\u0435\u0442 \u0431\u0443\u0434\u0443 "
+     "\u0431\u0443\u0434\u0435\u043c \u0431\u0443\u0434\u0443\u0442 \u043a\u0430\u043a\u043e\u0439 "
+     "\u043a\u0430\u043a\u0430\u044f \u043a\u0430\u043a\u0438\u0435 "
+     "\u043a\u043e\u0442\u043e\u0440\u044b\u0439 \u043a\u043e\u0442\u043e\u0440\u0430\u044f "
+     "\u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 "
+     "\u043a\u043e\u0442\u043e\u0440\u043e\u0439 \u043a\u043e\u0442\u043e\u0440\u043e\u0433\u043e "
+     "\u043a\u043e\u0442\u043e\u0440\u043e\u043c \u043a\u043e\u0442\u043e\u0440\u0443\u044e "
+     "\u043a\u043e\u0442\u043e\u0440\u044b\u043c \u0431\u0443\u0434\u0435\u0442\u0435 "
+     "\u0431\u0443\u0434\u0435\u0448\u044c \u043a\u0435\u043c \u0442\u0435\u0445 \u0442\u0435\u043c "
+     "\u0442\u0435\u043c\u0438 "
+     "\u0441\u0432\u043e\u0439 \u0441\u0432\u043e\u044f \u0441\u0432\u043e\u0438 "
+     "\u0441\u0432\u043e\u0435 \u0441\u0432\u043e\u0438\u0445 \u043c\u043e\u0439 \u043c\u043e\u044f "
+     "\u043c\u043e\u0438 \u043d\u0430\u0448 \u0432\u0430\u0448 \u0442\u0432\u043e\u0439 "
+     "\u043f\u0440\u0438 \u043f\u0440\u043e \u0431\u0435\u0437 \u043d\u0430\u0434 \u043f\u043e\u0434 "
+     "\u0447\u0435\u0440\u0435\u0437 \u043f\u043e\u0441\u043b\u0435 \u0438\u043b\u0438 "
+     "\u043b\u0438\u0431\u043e \u0440\u0430\u0437").split())
+# words a speaker says when they break off a take and start it again (SKILL.md step 3, sign 3): English, and Russian
+# wait (two forms), stop, over again, take (as in "take two"), let's once more, once more, sorry (two forms)
+RESTART_WORDS = [tuple(p.split()) for p in (
+    "wait", "hold on", "start over", "again", "one more time", "scratch that", "sorry",
+    "\u043f\u043e\u0434\u043e\u0436\u0434\u0438", "\u043f\u043e\u0433\u043e\u0434\u0438", "\u0441\u0442\u043e\u043f",
+    "\u0437\u0430\u043d\u043e\u0432\u043e", "\u0434\u0443\u0431\u043b\u044c",
+    "\u0434\u0430\u0432\u0430\u0439 \u0435\u0449\u0435 \u0440\u0430\u0437", "\u0435\u0449\u0435 \u0440\u0430\u0437",
+    "\u0438\u0437\u0432\u0438\u043d\u0438\u0442\u0435", "\u0438\u0437\u0432\u0438\u043d\u0438")]
+
+
+def take_words(text):
+    """The words of a text for comparing takes: NFKC, lowercase, Russian yo as ye, split on anything that is not a
+    letter or a digit, a hyphen too ("month-two" is two words)."""
+    t = unicodedata.normalize("NFKC", str(text or "")).lower().replace(_YO, _YE)
+    return [x for x in re.split(r"[\W_]+", t) if x]
+
+
+def stem(word):
+    """The first STEM_LEN letters: a word cut off mid-way in a broken take still matches the whole one."""
+    return word[:STEM_LEN]
+
+
+def significant(word):
+    """A word that makes two lines alike: longer than two letters and not a function word."""
+    return len(word) > 2 and word not in TAKE_STOP
+
+
+def take_stems(text):
+    """The stems of the text's significant words, in order."""
+    return [stem(w) for w in take_words(text) if significant(w)]
+
+
+def restart_at(ws):
+    """The restart phrase (RESTART_WORDS) in a list of take_words, or None."""
+    for k in range(len(ws)):
+        for p in RESTART_WORDS:
+            if tuple(ws[k:k + len(p)]) == p:
+                return " ".join(p)
+    return None
+
+
+# Remotion runs and their temp files. Remotion 4 puts every temp folder of a run into os.tmpdir() (TEMP, then TMP on
+# Windows; TMPDIR elsewhere): the webpack bundle with a full copy of the Remotion project's public/, the asset cache,
+# the render's working folder, Chrome's profile. Its own cleanup tries three times in a row and gives up, and on Windows
+# the compositor and Chrome hold their files for seconds after the end, so the folders stay (a real laptop: 571 folders,
+# 33.5 GB in a month; then 824 Chrome profiles, 1.7 GB). And the bundle copies public/ whole on every run: a project
+# with the videos of a series in it (1.5 GB) copied 1.5 GB for each render, storyboard sheet and text check.
+# remotion_tmp() gives a run its own folder and removes it when the run ends, however it ends; a ReelKit or ReelCover
+# run with props also gets a public/ of hard links to only the files its props use (--public-dir).
+TMP_ROOT = "it-reelsmaker"         # <temp>/it-reelsmaker/r-<pid>-<n>/: one folder per Remotion run
+TMP_STALE_S = 6 * 3600             # a run folder older than this was left by a killed run
+TMP_PENDING = "pending.json"       # run folders a run could not remove yet (files still held)
+TMP_WAIT_S = 15.0                  # how long a run waits for Windows to release its files
+KIT_COMPS = ("ReelKit", "ReelCover")  # compositions that read only what their props name (a per-video one may not)
+REMOTION_LEFTOVERS = ("remotion-v*-assets*", "remotion-webpack-bundle-*", "react-motion-render*",
+                      "puppeteer_dev_chrome_profile-*")  # what Remotion 4 runs leave in the system temp folder
+
+
+def tmp_root():
+    return Path(tempfile.gettempdir()) / TMP_ROOT
+
+
+def dir_size(p):
+    """Bytes in a folder, links not followed."""
+    n = 0
+    for root, _dirs, files in os.walk(p):
+        for f in files:
+            try:
+                n += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return n
+
+
+def remove_tree(p, wait=TMP_WAIT_S):
+    """Remove a folder, retrying while another process still holds its files. -> True when it is gone."""
+    t0 = time.time()
+    while True:
+        shutil.rmtree(p, ignore_errors=True)
+        if not os.path.exists(p):
+            return True
+        if time.time() - t0 >= wait:
+            return False
+        time.sleep(0.5)
+
+
+def temp_cleanup_on(project=None):
+    """it-reelsmaker.json -> "temp_cleanup": false turns the run folders and the trimmed public/ off."""
+    try:
+        return project_settings(project).get("temp_cleanup", True) is not False
+    except (OSError, ValueError):
+        return True
+
+
+def sweep_tmp(now=None):
+    """What earlier runs left in <temp>/it-reelsmaker: the folders in pending.json and run folders older than
+    TMP_STALE_S. -> bytes freed. Only this plugin's own folders: names elsewhere in the temp folder are never touched
+    here (kit.py clean-temp lists those)."""
+    root = tmp_root()
+    if not root.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    freed, pend = 0, root / TMP_PENDING
+    with locked(pend, timeout=10):
+        listed = [p for p in (load_json(pend, []) or []) if isinstance(p, str)]
+        keep = []
+        for p in listed:
+            q = Path(p)
+            if q.parent != root or not q.exists():
+                continue
+            n = dir_size(q)
+            if remove_tree(q, wait=1):
+                freed += n
+            else:
+                keep.append(p)
+        for q in root.iterdir():
+            try:
+                old = q.is_dir() and q.name.startswith("r-") and now - q.stat().st_mtime > TMP_STALE_S
+            except OSError:
+                continue
+            if old and str(q) not in keep:
+                n = dir_size(q)
+                if remove_tree(q, wait=1):
+                    freed += n
+        if keep:
+            save_json(pend, keep)
+        elif pend.exists():
+            pend.unlink()
+    return freed
+
+
+def _strings(x):
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from _strings(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _strings(v)
+
+
+def public_files(rem, props):
+    """The files of the Remotion project's public/ that a ReelKit run with these props reads: every path the props
+    name, the whole folder of the video (public/<id>/: the rough cut, inserts, the cut-out) and public/brands/ (logos,
+    fonts). -> sorted paths, or [] when the props name nothing there."""
+    pub = Path(rem) / "public"
+    if not pub.is_dir() or not isinstance(props, dict):
+        return []
+    want, dirs = set(), set()
+    for s in _strings(props):
+        r = s.strip().replace("\\", "/").lstrip("/")
+        if not r or len(r) > 400 or ":" in r or ".." in r.split("/"):  # ":": a URL, data: or a drive (C:/…)
+            continue
+        try:
+            f = pub / r
+            if f.is_file():
+                want.add(f)
+                if len(Path(r).parts) > 1:
+                    dirs.add(pub / Path(r).parts[0])
+        except (OSError, ValueError):
+            continue
+    if not want:
+        return []
+    dirs.add(pub / "brands")
+    for d in dirs:
+        if d.is_dir() and d.name != "public":
+            want.update(f for f in d.rglob("*") if f.is_file())
+    return sorted(want)
+
+
+def stage_public(rem, props, dest):
+    """public/ for one run in dest: hard links to public_files() (a copy where a link is impossible, another disk).
+    -> the number of files, 0 when nothing could be staged (the run then reads the project's own public/)."""
+    files = public_files(rem, props)
+    pub = Path(rem) / "public"
+    n = 0
+    for f in files:
+        t = Path(dest) / f.relative_to(pub)
+        t.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(f, t)
+        except OSError:
+            try:
+                shutil.copy2(f, t)
+            except OSError:
+                return 0
+        n += 1
+    return n
+
+
+@contextlib.contextmanager
+def remotion_tmp(rem=None, props=None, comp=None, quiet=False):
+    """with remotion_tmp(rem, props, comp) as (env, args): subprocess.run(cmd + args, cwd=rem, env=env)
+    A run folder <temp>/it-reelsmaker/r-<pid>-<n>/ as the run's TEMP, TMP and TMPDIR, removed when the block ends
+    (success, error, Ctrl+C), waiting up to TMP_WAIT_S for Windows to release the files; what is still held goes to
+    pending.json and the next run removes it. A ReelKit / ReelCover run with props also gets args =
+    ["--public-dir=<run folder>/public"] with only that video's files. props: the dict, or a path to the props file.
+    "temp_cleanup": false in it-reelsmaker.json -> the old behavior: no run folder, the project's public/."""
+    if not temp_cleanup_on():
+        yield dict(os.environ), []
+        return
+    try:
+        freed = sweep_tmp()
+    except (OSError, SystemExit):
+        freed = 0
+    root = tmp_root()
+    root.mkdir(parents=True, exist_ok=True)
+    d = root / f"r-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    d.mkdir()
+    env = {**os.environ, "TEMP": str(d), "TMP": str(d), "TMPDIR": str(d)}
+    args = []
+    if rem and comp in KIT_COMPS and props:
+        doc = props if isinstance(props, dict) else load_json(props, None)
+        if stage_public(rem, doc, d / "public"):
+            args = [f"--public-dir={d / 'public'}"]
+    try:
+        yield env, args
+    finally:
+        n = dir_size(d)
+        if remove_tree(d):
+            freed += n
+        else:
+            try:
+                with editing_json(root / TMP_PENDING, []) as pend:
+                    if str(d) not in pend:
+                        pend.append(str(d))
+            except (OSError, SystemExit):
+                pass
+            warn(f"Remotion still holds files in {d}: the next run removes them")
+        if freed >= 1 << 20 and not quiet:
+            print(f"temp files of Remotion removed: {freed / (1 << 20):.0f} MB", file=sys.stderr)
+
+
+def remotion_leftovers(hours=24.0, now=None, measure=True):
+    """Folders that Remotion runs outside remotion_tmp() left in the system temp folder (REMOTION_LEFTOVERS), not
+    changed for `hours`. -> [(path, bytes)] (bytes None with measure=False: ~10 s for 800 Chrome profiles). Chrome
+    profiles of that name can belong to other programs too, so these are removed only on request (kit.py clean-temp
+    --yes)."""
+    base = Path(tempfile.gettempdir())
+    now = time.time() if now is None else now
+    out = []
+    for pat in REMOTION_LEFTOVERS:
+        for q in base.glob(pat):
+            try:
+                if q.is_dir() and now - q.stat().st_mtime > hours * 3600:
+                    out.append((q, dir_size(q) if measure else None))
+            except OSError:
+                continue
+    return sorted(out)

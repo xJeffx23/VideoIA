@@ -1,0 +1,17 @@
+#!/bin/bash
+# Lanza VideoIA desde cualquier carpeta, aunque se llame por un enlace.
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+RAIZ="$(cd -P "$(dirname "$src")/.." && pwd)"
+if [ ! -x "$RAIZ/.venv/bin/python" ]; then
+  echo "VideoIA aún no está instalado. Ejecuta: $RAIZ/instalar.sh" >&2
+  exit 1
+fi
+export VIDEOIA_RAIZ="$RAIZ"
+export PATH="$RAIZ/.venv/bin:$PATH"
+exec "$RAIZ/.venv/bin/python" "$RAIZ/videoia/cli.py" "$@"

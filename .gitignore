@@ -1,0 +1,16 @@
+# Medios personales y de terceros: nunca se suben
+Referencias/*
+!Referencias/.gitkeep
+Material-Crudo/*
+!Material-Crudo/.gitkeep
+Resultados/*
+!Resultados/.gitkeep
+
+# Trabajo y entorno
+.videoia/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/settings.local.json
